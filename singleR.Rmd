@@ -1,0 +1,128 @@
+---
+title: "SingleR"
+author: "Layaa Sivakumar"
+date: "2025-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+# Exploring SingleR: Automatic annotation for single-cell RNA-seq data using a single reference dataset
+
+```{r}
+library(SingleR)
+library(celldex)
+library(Seurat)
+library(tidyverse)
+library(pheatmap)
+
+```
+
+The dataset I'll be working on for this project is single cell RNA-seq data derived from human peripheral blood mononuclear cells (PBMCs) of a healthy female donor aged 25-30. The data was obtained by 10x Genomics from AllCells. 
+
+```{r, Load data}
+# Load data 
+
+hdf5_obj <- Read10X_h5(filename = "C:\\Users\\layaa\\Documents\\2024\\Homework\\PD-project-datasets\\singleR\\20k_PBMC_3p_HT_nextgem_Chromium_X_filtered_feature_bc_matrix.h5",
+                       use.names = TRUE,
+                       unique.features = TRUE)
+
+pbmc.seurat <- CreateSeuratObject(counts=hdf5_obj)
+
+```
+
+
+```{r, Filtering and QC}
+# Filtering and QC
+
+# These parameters filter out cells with few genes detected and high mitochondrial genes, and genes that are expressed at low levels across all cells
+pbmc.seurat$mitoPercent <- PercentageFeatureSet(pbmc.seurat, pattern = '^MT-')
+pbmc.seurat.filtered <- subset(pbmc.seurat, subset = nCount_RNA > 800 &
+         nFeature_RNA > 500 &
+         mitoPercent < 10)
+
+```
+
+
+```{r Standard sc workflow}
+# Standard workflow
+pbmc.seurat.filtered <- NormalizeData(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- FindVariableFeatures(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- ScaleData(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- RunPCA(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- FindNeighbors(object = pbmc.seurat.filtered, dims = 1:20)
+pbmc.seurat.filtered <- FindClusters(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- RunUMAP(object = pbmc.seurat.filtered, dims = 1:20)
+
+# running steps above to get clusters
+DimPlot(pbmc.seurat.filtered, reduction = 'umap')
+```
+
+For this dataset, I will be using the human primary cell atlas data from the celldex package as the reference dataset.
+
+```{r, Get refernence data}
+
+# Get reference data
+
+ref <- celldex::HumanPrimaryCellAtlasData()
+
+# expression values are log counts (log normalized counts)
+```
+
+Then, I isolate the counts data from the seurat object of the study dataset, and run singleR annotation using this and the reference. The final cluster annotations from singleR are shown in the UMAP.
+
+```{r, Run SingleR}
+
+# run SingleR (default mode)
+# default for SingleR is to perform annotation of each individual cell in the test dataset
+
+pbmc_counts <- GetAssayData(pbmc.seurat.filtered, slot = 'counts')
+
+pred <- SingleR(test = pbmc_counts,
+        ref = ref,
+        labels = ref$label.main)
+
+head(pred)
+
+pbmc.seurat.filtered$singleR.labels <- pred$labels[match(rownames(pbmc.seurat.filtered@meta.data), rownames(pred))]
+DimPlot(pbmc.seurat.filtered, reduction = 'umap', group.by = 'singleR.labels', label=TRUE)
+
+```
+
+Then, we can run diagnostics on the annotation to determine their quality and accuracy. There are several measurements we can look at. When we ran singleR, each cell's alignment to every label was measured and stored in columns called scores. We can have high confidence in the annotations where the score for 1 annotation is notably higher than the others. This is what we are looking at in this heatmap. 
+
+For example, the cells classified as B cells (on the left) uniformly express the B cell markers at higher levels than other genes. 
+
+
+```{r, Annotation diagnostics}
+# Annotation diagnostics
+# ...Based on the scores within cells -----------
+plotScoreHeatmap(pred)
+
+```
+
+We can also look at the delta scores across cells. This is another indicator of the confidence of the assigned label. It represents the difference in score between the assigned label and the second most likely label. A higher delta indicates a more confident classification of that cell as its assigned label. In this figure, we see a lot of the cells classified as monocytes have a low delta, indicating their assignment to the monocyte label may be more ambiguous than other cells. 
+
+
+```{r}
+# ...Based on deltas across cells ----------
+plotDeltaDistribution(pred)
+
+```
+
+Finally, this heatmap shows how exclusive each cluster in the UMAP is. For example, cluster 8 is composed of an approximately equal number of NK and T cells. On the other hand, cluster 2 contains exclusively T cells. Thus, this shows the purity of the clusters, and the distribution of different cell types across the UMAP. It may indicate more finer labels for those of the same label in different clusters i.e., clusters 3-6, 9, 14 all contain exclusively monocytes, yet are clustered separately. 
+
+
+```{r}
+# ...Comparing to unsupervised clustering ------------
+
+tab <- table(Assigned=pred$labels, Clusters=pbmc.seurat.filtered$seurat_clusters)
+pheatmap(log10(tab+10), color = colorRampPalette(c('white','blue'))(10))
+
+```
+
+
+
+

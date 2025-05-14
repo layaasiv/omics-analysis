@@ -1,0 +1,459 @@
+---
+title: "integrated-sc-analysis-workflow"
+author: "Layaa Sivakumar"
+date: "2025-01-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+```
+
+### Overview 
+
+This project aims to demonstrate the single-cell RNA-seq (scRNA-seq) data analysis workflow for data which exhibits batch effects. The dataset used here is derived from a study by Aronow et al. (2021) titled "Identification of distinct tumor cell populations and key genetic mechanisms through single cell sequencing in hepatoblastoma." It contains scRNA-seq data of background liver tissue, hepatoblastoma (tumor) tissue and patient derived xenograft (PDX) derived from 3 different individuals.
+
+```{r, echo=FALSE}
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(patchwork)
+
+```
+
+```{r, echo=FALSE}
+top_path <- "C:\\Users\\layaa\\Documents\\2024\\Homework\\PD-project-datasets\\integrated-sc-data\\"
+
+dirs <- list.dirs(path = top_path, recursive = T, full.names = F)
+# there's is an empty folder coming up at 1st index so to remove that:
+dirs <- dirs[2:8]
+
+# for loop to get files from each folder to create counts matrix and use it to create Seurat obj that has patient and tissue info. Assign each matrix to the core name of the directory it came from 
+
+for(x in dirs){
+  name <- gsub("_filtered_feature_bc_matrix", "", x)
+  
+  cts <- ReadMtx(mtx = paste0(top_path,x,"\\matrix.mtx.gz"),
+          features = paste0(top_path,x,"\\features.tsv.gz"),
+          cells = paste0(top_path,x,"\\barcodes.tsv.gz"))
+  
+  assign(name, CreateSeuratObject(counts = cts))
+}
+
+```
+
+### Quality control analysis
+
+```{r}
+# merge datasets 
+merged_seurat <- merge(HB17_background, y = c(HB17_PDX, HB17_tumor, HB30_PDX, HB30_tumor, HB53_background, HB53_tumor), 
+      add.cell.ids = ls()[3:9], # this differentiates between cells coming from different samples (i.e., patient identifier, tissue type)
+      project = "HB")
+
+# create a sample column
+merged_seurat$sample <- rownames(merged_seurat@meta.data)
+
+# split the sample column 
+merged_seurat@meta.data <- separate(merged_seurat@meta.data, col = 'sample', into = c('Patient', 'Type', 'Barcode'), 
+         sep = '_')
+
+# calculate percent mitochondrial genes 
+merged_seurat$mitoPercent <-  PercentageFeatureSet(merged_seurat, pattern = "^MT-")
+
+# look at counts, feature and mitochondrial data 
+VlnPlot(merged_seurat, features = c("nCount_RNA", "nFeature_RNA", "mitoPercent"), ncol = 3)
+
+# plot nCount and nFeature 
+FeatureScatter(merged_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_smooth(method = 'lm')
+```
+
+
+```{r, In-depth QC}
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# create metadata df 
+metadata <- merged_seurat@meta.data
+
+# rename cols 
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+# add metadata back to Seurat obj
+merged_seurat@meta.data <- metadata
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=Type, fill=Type)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=Type, x=nUMI, fill= Type)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 800)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=Type, x=nGene, fill= Type)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 500)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=Type, y=log10(nGene), fill=Type)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoPercent)) + 
+  	geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  facet_wrap(~Type) +
+  geom_vline(xintercept = 1000) +
+  geom_hline(data = filter(metadata, Type=="background"), aes(yintercept = 500)) +
+  geom_hline(data = filter(metadata, Type=="background"), aes(yintercept = 6000)) +
+  geom_hline(data = filter(metadata, Type=="PDX"), aes(yintercept = 6000)) +
+  geom_hline(data = filter(metadata, Type=="PDX"), aes(yintercept = 900)) +
+  geom_hline(data = filter(metadata, Type=="tumor"), aes(yintercept = 6000)) +
+  geom_hline(data = filter(metadata, Type=="tumor"), aes(yintercept = 700))
+```
+
+From the mitochondrial percentages depicted in the final plot, it looks like PDX and tumor samples overall have a great majority of healthy cells. There are generally more samples coming from tumor tissue than the PDX and background. However, the mitochondrial percentage in the background samples is high even in cells with high UMI and gene count. However, hepatocytes in general have high mitochondrial content. Therefore, this result may not be abnormal. To account for this, I will use a more lenient threshold for mitoPercent i.e., 50%. 
+
+### Filtering 
+
+I am going to try filtering this dataset with two sets of parameters: the first, which was outlined in the study (Aronow et al., 2021), and the second using parameters that I have chosen using my judgement of this dataset. 
+
+```{r filtering with study parameters}
+# merged_seurat_study.filtered <- subset(merged_seurat, subset = nGene > 500 &
+#                                          nUMI > 800 &
+#                                          mitoPercent < 10)
+# 
+# merged_seurat_study.filtered@meta.data %>% 
+#   	ggplot(aes(x=nUMI, y=nGene, color=mitoPercent)) + 
+#   	geom_point() + 
+#   scale_colour_gradient(low = "gray90", high = "black") +
+#   	stat_smooth(method=lm) +
+#   	scale_x_log10() + 
+#   	scale_y_log10() + 
+#   	theme_classic() +
+#   facet_wrap(~Type)
+
+```
+
+Below, I filter using my own parameters. I decided to use quality control filters that are tissue-type specific since there are some differences between them as seen in the exploratory plots in "Quality Control" section. Specifically, the cells from background tissue show high mitoPercent. 
+
+After filtering the original merged Seurat object (cells from each type filtered separately), I visualized the number of cells retained in each Type. The proportions of the cells has not changed significantly. I also plotted the number of UMIs/number of genes correlation plot again.
+
+```{r}
+# filter the cells from the different tissues separately
+background <- subset(merged_seurat, subset = Type == "background" &
+                       nGene > 500 & nGene < 6000 &
+                       nUMI > 800 &
+                       mitoPercent < 50)
+pdx <- subset(merged_seurat, subset = Type == "PDX" &
+                nGene > 900 & nGene < 6000 &
+                nUMI > 800 &
+                mitoPercent < 50)
+tumor <- subset(merged_seurat, subset = Type == "tumor" &
+                  nGene > 700 & nGene < 4000 &
+                  nUMI > 800 &
+                  mitoPercent < 50)
+
+# merge the filtered by type seurat objects together
+merged_seurat_filtered <- merge(background, y = c(pdx, tumor),
+      project = "HB")
+
+# check filtered cells to ensure filtering parameters are appropriate
+metadata_filtered <- merged_seurat_filtered@meta.data
+
+# Visualize the number of cell counts per sample
+metadata_filtered %>%
+  	ggplot(aes(x=Type, fill=Type)) +
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata_filtered %>%
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoPercent)) +
+  	geom_point() +
+  scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() +
+  	scale_y_log10() +
+  	theme_classic() +
+  facet_wrap(~Type)
+```
+
+The filtered dataset looks good. Most of the cell with high mitochondrial content are from background hepatic tissue. The proportion of number of cells in background/PDX to tumor is similar to the unfiltered dataset. 
+
+### Standard workflow 
+
+Now, I will use the filtered datasets to carry out the standard scRNA-seq analysis workflow, specifically normalizing and scaling data, and then visualizing clusters on UMAP. 
+
+```{r standard workflow using data filtered using study parameters, echo=FALSE, eval=FALSE}
+# merged_seurat_study.filtered <- NormalizeData(object = merged_seurat_study.filtered)
+# merged_seurat_study.filtered <- FindVariableFeatures(object = merged_seurat_study.filtered)
+# merged_seurat_study.filtered <- ScaleData(object = merged_seurat_study.filtered)
+# merged_seurat_study.filtered <- RunPCA(object = merged_seurat_study.filtered)
+# ElbowPlot(merged_seurat_study.filtered)
+# 
+# merged_seurat_study.filtered <- FindNeighbors(object = merged_seurat_study.filtered, dims = 1:20)
+# merged_seurat_study.filtered <- FindClusters(merged_seurat_study.filtered)
+# merged_seurat_study.filtered <- RunUMAP(merged_seurat_study.filtered, dims = 1:20)
+# 
+# # plot 
+# p6 <- DimPlot(merged_seurat_study.filtered, reduction = 'umap', group.by = 'Patient')
+# p7 <- DimPlot(merged_seurat_study.filtered, reduction = 'umap', group.by = 'Type', cols = c('red', 'green', 'blue'))
+# 
+# grid.arrange(p6, p7, ncol = 2)
+
+```
+
+
+```{r}
+merged_seurat_filtered <- NormalizeData(object = merged_seurat_filtered)
+merged_seurat_filtered <- FindVariableFeatures(object = merged_seurat_filtered)
+merged_seurat_filtered <- ScaleData(object = merged_seurat_filtered)
+merged_seurat_filtered <- RunPCA(object = merged_seurat_filtered)
+ElbowPlot(merged_seurat_filtered)
+
+merged_seurat_filtered <- FindNeighbors(object = merged_seurat_filtered, dims = 1:20)
+merged_seurat_filtered <- FindClusters(merged_seurat_filtered)
+merged_seurat_filtered <- RunUMAP(merged_seurat_filtered, dims = 1:20)
+
+# plot 
+p1 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = 'Patient')
+p2 <- DimPlot(merged_seurat_filtered, reduction = 'umap', group.by = 'Type', cols = c('red', 'green', 'blue'))
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+I decided to keep all 20 dimensions of the PCA for both datasets. From the UMAP clusters for both datasets, it looks like the cells are being characterized by both patient- and tissue-specific variables. For example, the cells from background tissue form 2 different clusters that represent the 2 different patients that these samples originate from. Therefore, we have batch effect here. 
+
+### Data integration for batch effect correction
+
+```{r, echo=FALSE, eval=FALSE, echo=FALSE}
+#### this code chunk does not work, despite being included in the tutorial ####
+# obj.list <- SplitObject(merged_seurat_filtered, split.by = "Patient")
+# 
+# for (i in 1:length(obj.list)){
+#   obj.list[[i]] <- NormalizeData(obj.list[[i]])
+#   obj.list[[i]] <- FindVariableFeatures(obj.list[[i]])
+# }
+# 
+# # select integration features 
+# features <- SelectIntegrationFeatures(object.list = obj.list)
+# 
+# # find integration anchors 
+# anchors <- FindIntegrationAnchors(object.list = obj.list,
+#                                   anchor.features = features)
+# 
+# # integrate data 
+# seurat_integrated <- IntegrateData(anchorset = anchors)
+
+```
+
+
+```{r integration using dataset filtered by study parameters, echo=FALSE, eval=FALSE}
+# study.harmony <- IntegrateLayers(
+#   object = merged_seurat_study.filtered, method = HarmonyIntegration,
+#   orig.reduction = "pca", new.reduction = "harmony",
+#   verbose = T
+# )
+# 
+# study.harmony <- FindNeighbors(study.harmony, reduction = "harmony", dims = 1:20)
+# study.harmony <- FindClusters(study.harmony, resolution = 0.5, cluster.name = "harmony_clusters")
+# 
+# study.harmony <- RunUMAP(study.harmony, reduction = "harmony", dims = 1:20, reduction.name = "umap.harmony")
+# 
+# DimPlot(
+#   study.harmony,
+#   reduction = "umap.harmony",
+#   group.by = c("Patient", "Type"),
+#   combine = FALSE, label.size = 2)
+
+```
+
+From these UMAPs, there is significant overlap between all tissues in most of the clusters. Therefore, Harmony has resolved the batch effect well. 
+
+Since there are several integration methods for scRNA-seq data, I decided to test two methods on the dataset with my custom filter, namely canonical correlation analysis (CCA) and Harmony.
+
+Shown first are the results of the CCA integration:
+
+```{r cca}
+
+seurat_integrated <- IntegrateLayers(
+  object = merged_seurat_filtered, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+
+seurat_integrated <- FindNeighbors(seurat_integrated, reduction = "integrated.cca", dims = 1:20)
+seurat_integrated <- FindClusters(seurat_integrated, resolution = 0.5, cluster.name = "cca_clusters")
+
+seurat_integrated <- RunUMAP(seurat_integrated, reduction = "integrated.cca", dims = 1:20, reduction.name = "umap.cca")
+
+DimPlot(
+  seurat_integrated,
+  reduction = "umap.cca",
+  group.by = c("Patient", "Type"),
+  combine = FALSE, label.size = 2)
+
+```
+
+Next is Harmony:
+
+```{r harmony}
+harmony <- IntegrateLayers(
+  object = merged_seurat_filtered, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony",
+  verbose = FALSE
+)
+
+harmony <- FindNeighbors(harmony, reduction = "harmony", dims = 1:20)
+harmony <- FindClusters(harmony, resolution = 0.5, cluster.name = "harmony_clusters")
+
+harmony <- RunUMAP(harmony, reduction = "harmony", dims = 1:20, reduction.name = "umap.harmony")
+
+DimPlot(
+  harmony,
+  reduction = "umap.harmony",
+  group.by = c("Patient", "Type"),
+  combine = FALSE, label.size = 2)
+
+```
+
+
+```{r rpca, echo=F, eval=FALSE}
+rpca <- IntegrateLayers(
+   object = merged_seurat_filtered, method = RPCAIntegration,
+   orig.reduction = "pca", new.reduction = "integrated.rpca",
+   verbose = FALSE
+ )
+
+rpca <- FindNeighbors(rpca, reduction = "integrated.rpca", dims = 1:20)
+rpca <- FindClusters(rpca, resolution = 0.5, cluster.name = "rpca_clusters")
+
+rpca <- RunUMAP(rpca, reduction = "integrated.rpca", dims = 1:20, reduction.name = "umap.rpca")
+
+DimPlot(
+  rpca,
+  reduction = "umap.rpca",
+  group.by = c("Patient", "Type", "rpca_clusters"),
+  combine = FALSE, label.size = 2)
+
+# wrap_plots(c(p3,p4,p5), nrow = 3, byrow = T)
+```
+
+It appears that the CCA method over-corrects, causing all the cells to create a large blob in the middle of the plot despite being from different tissue types (background, tumor, PDX). With Harmony, patient-wise batch effect has been corrected, and variables specific to cell types is conserved to a greater degree than in the CCA integration as evidenced by the presence of some clustering. I also tried the rPCA method, and the results looked very similar to Harmony.
+
+Therefore, I would conduct the downstream analyses with the Harmony or rPCA integrated dataset.
+
+```{r, eval=FALSE, echo=FALSE, eval=FALSE}
+# # need to join layers before doing downstream analyses 
+joined.harmony <- JoinLayers(harmony)
+# 
+# findAllMarkers
+all.markers <- FindAllMarkers(joined.harmony,
+                              logfc.threshold = 0.25,
+                              min.pct = 0.1,
+                              only.pos = T,
+                              )
+# 
+# # findConservedMarkers
+# # represent mostly background tissue
+# markers.cl3 <- FindConservedMarkers(joined.harmony,
+#                                     ident.1 = 3,
+#                                     grouping.var = "Patient")
+# 
+# # represents mostly tumor + some PDX
+# markers.cl1 <- FindConservedMarkers(joined.harmony,
+#                                     ident.1 = 1,
+#                                     grouping.var = "Patient")
+# 
+# # represents mostly PDX + some tumor
+# markers.cl5 <- FindConservedMarkers(joined.harmony,
+#                                     ident.1 = 5,
+#                                     grouping.var = "Patient")
+# 
+# # represents mostly tumor + some background
+# markers.cl8 <- FindConservedMarkers(joined.harmony,
+#                                     ident.1 = 8,
+#                                     grouping.var = "Patient")
+
+```
+
+```{r find conserved markers, echo=FALSE, eval=FALSE}
+# DimPlot(joined.harmony, reduction = "umap.harmony", label = T)
+# 
+# FeaturePlot(joined.harmony,
+#             reduction = "umap.harmony",
+#             features = c("PDGFRB", "SOX9", "COL1A1" ,"FAP", "PECAM1", "AFP"),
+#             min.cutoff = 'q10' 
+#             )
+
+# PTPRC = B cells 
+```
+
+
+```{r, eval=FALSE, echo=FALSE, eval=FALSE}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+cl_gene_list <- split(all.markers$gene, all.markers$cluster)
+
+cl_gene_list <- lapply(cl_gene_list, function(genes) {
+  gene_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  return(gene_ids$ENTREZID)
+})
+
+go_compare_bp <- compareCluster(geneCluster = cl_gene_list, 
+                             fun = "enrichGO", 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "BP",  # "BP"、"MF" or "CC"
+                             pAdjustMethod = "BH",
+                             pvalueCutoff = 0.05,
+                             qvalueCutoff = 0.05)
+
+dotplot(go_compare_bp, showCategory = 1,
+              title = "GO Enrichment (Biological Process)") + 
+  theme(axis.text.y = element_text(size = 10))
+
+
+```
+
+
+
+
+
+
+
+
