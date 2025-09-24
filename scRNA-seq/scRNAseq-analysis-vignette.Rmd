@@ -1,0 +1,486 @@
+---
+title: "scRNAseq-analysis-vignette"
+author: "Layaa Sivakumar"
+date: "2024-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## scRNAseq analysis vignette
+
+```{r import Seurat package}
+library(Seurat)
+```
+
+```{r create Seurat obj}
+counts <- Read10X(data.dir = "C:/Users/layaa/Documents/2024/Homework/DS1")
+seurat <- CreateSeuratObject(counts, project="DS1")
+```
+
+```{r find mitochondrial transcript percentage}
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^MT[-\\.]")
+```
+
+```{r violin plots of nFeatures (number of genes), nCounts (number of transcripts) and percent.mt}
+VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size=0)
+```
+```{r}
+library(patchwork)
+plot1 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+And as one would expect, number of detected genes and number of detected transcripts are well correlated across cells (R = 0.93) while mitochondrial transcript percentage is not.
+
+Due to the correlation of gene number and transcript number, we only need to set a cutoff to either one of these metrics, combined with an upper threshold of mitochondrial transcript percentage, for the QC. For instance, for this data set, a detected gene number between 500 and 5000, and a mitochondrial transcript percentage lower than 5% would be quite reasonable, but it is fine to use different thresholds.
+
+```{r}
+seurat <- subset(seurat, subset = nFeature_RNA > 500 & nFeature_RNA < 5000 & percent.mt < 5)
+```
+
+### Normalization
+
+Similar to bulk RNA-seq, the amount of captured RNA is different from cell to cell, and one should therefore not directly compare the number of captured transcripts for each gene between cells. A normalization step, aiming to make gene expression levels between different cells comparable, is therefore necessary. The most commonly used normalization in scRNA-seq data analysis is very similar to the concept of TPM (Transcripts Per Million reads) - one normalizes the feature expression measurements for each cell to the total expression, and then multiplies this by a scale factor (10000 by default). At the end, the resulting expression levels are log-transformed so that the expression values better fit a normal distribution. It is worth to mention that before doing the log-transformation, one pseudocount is added to every value so that genes with zero transcripts detected in a cell still present values of zero after log-transform.
+
+In principle there are several parameters one can set in the NormalizeData function, but most of the time the default settings are good.
+
+```{r normalization}
+seurat <- NormalizeData(seurat)
+```
+
+### Feature selection
+
+By default, Seurat calculates the standardized variance of each gene across cells, and picks the top 2000 ones as the highly variable features. One can change the number of highly variable features easily by giving the nfeatures option (here the top 3000 genes are used).
+
+There is no good criteria to determine how many highly variable features to use. Sometimes one needs to go through some iterations to pick the number that gives the most clear and interpretable result. Most often, a value between 2000 to 5000 is OK and using a different value doesn't affect the results too much.
+
+```{r feature selection}
+seurat <- FindVariableFeatures(seurat, nfeatures = 3000)
+```
+
+```{r}
+top_features = head(VariableFeatures(seurat), 20)
+plot1 <- VariableFeaturePlot(seurat)
+plot2 <- LabelPoints(plot = plot1, points = top_features, repel = TRUE, xnudge = 0, ynudge = 0)
+plot1
+plot2
+```
+
+### Data scaling
+
+Since different genes have different base expression levels and distributions, the contribution of each gene to the analysis is different if no data transformation is performed. This is something we do not want as we don't want our analysis to only depend on genes that are highly expressed. Therefore a scaling is applied to the data using the selected features, just like one usually does in any data science field.
+
+```{r data scaling}
+seurat <- ScaleData(seurat)
+```
+
+At this step, one can also remove unwanted sources of variation from the data set by setting the parameter var.to.regress:
+
+```{r}
+seurat <- ScaleData(seurat, vars.to.regress = c("nFeature_RNA", "percent.mt"))
+```
+
+### Alternative to steps Normalization, Feature Selection and Data Scaling using SCTransform
+
+One problem of doing the typical log-normalization is that is introduces the zero-inflation artifact into the scRNA-seq data. To better resolve this issue, Hafemeister and Satija introduced an R package sctransform, which uses a regularized negative binomial regression model to normalize scRNA-seq data. Seurat has a wrapper function SCTransform. 
+
+```{r}
+seurat <- SCTransform(seurat, variable.features.n = 3000)
+```
+
+The variable.features.n controls the number of highly variable features to identify. One can also add information about which unwanted sources of variation to regress out. For instance,
+
+```{r}
+seurat <- SCTransform(seurat,
+                      vars.to.regress = c("nFeature_RNA", "percent.mt"),
+                      variable.features.n = 3000)
+```
+
+This operation combines normalization, scaling and highly variable feature identification so it essentially replaces steps 3-5 from above. Drawbacks of running SCTransform include
+
+1. It is relatively slow.
+2. It makes the normalized expression measurements data-dependent. In the standard procedure, the normalization only relies on the cell itself; in SCTransform, however, information from the other cells in the same data set is involved during normalization. This potentially introduces problems when multiple data sets need to be compared, since the normalized expression measurements of two data sets each individually normalized using SCTransform are not comparable.
+
+There are steps in SCTransform which involve random sampling to speed up the computation. That means that there is some stochasticity in SCTransform and the result is slightly different every time, even if it is applied to the same data set.
+
+Therefore, it should be used wisely. There are some scenarios in which trying SCTransform would be recommended. For instance, you might perform a differential expression analysis between cells of two conditions, and the results show a dramatic bias in DE, i.e. a huge amount of genes with increased expression but very few genes with decreased expression. If the data for the two conditions shows very different coverage (e.g. the condition with a lot of decreased expression shows significantly smaller number of detected gene/transcript numbers), such a biased DE result may be indeed an artifact introduced by the standard normalization procedure. In this case, using SCTransform may help to reduce the artifact.
+
+
+### Linear dimensionality reduction using principal component analysis (PCA)
+
+In principle one can start to look at cell heterogeneity after identifying highly variable genes and scaling the data. However, applying a linear dimension reduction before doing any further analysis is strongly recommended and sometimes even seen as compulsory. The benefit of doing such a dimension reduction includes but is not limited to:
+
+1. The data becomes much more compact so that computation becomes much faster.
+2. As scRNA-seq data is intrinsically sparse, summarizing measurements of related features greatly enhances the signal robustness.
+
+Any Drawback? Basically none. Well, one needs some extra lines in the script and needs to decide on the number of reduced dimensions to use in the following analysis, but that's it.
+
+For scRNA-seq data, the linear dimension reduction mostly refers to principal component analysis, short PCA.
+
+```{r}
+seurat <- RunPCA(seurat, npcs = 50)
+```
+The number of principal components (PCs) that one can calculate for a data set is equal to the number of highly variable genes or the number of cells, whichever value is smaller. However, most of these PCs are not informative and only represent random noise. Only the top PCs are informative and represent differences among cell populations. Therefore, instead of calculating all possible PCs, Seurat uses truncated PCA to only calculate the first PCs, by default the top 50 PCs. One can change that by setting the npcs parameter.
+
+Even then, one doesn't necessarily use all the calculated PCs. Determinting how many top PCs to use is an art. There is no golden standard, and everyone has his/her own understanding. The so-called elbow plot method can help with the decision. It consists of plotting the explained variation as a function of each PC, and picking the elbow of the curve as the number of PCs to use.
+
+```{r}
+ElbowPlot(seurat, ndims = ncol(Embeddings(seurat, "pca")))
+```
+P.S. Embeddings is the function in Seurat to obtain the dimension reduction result given the name of the dimension reduction of interest. By default, the RunPCA function stores the PCA result in the embedding called 'pca', with each column being one PC. So here it tells Seurat to construct the elbow plot to show the standarized variation of all the PCs that are calculated.
+
+As it is defined, higher-ranked PCs explain more variation in the data (have higher standard deviations) than lower-ranked PCs. However, the decrease of standard deviation is not linear. The curve of the elbow plot drops dramatically for the first few PCs, and then slows down and becomes pretty flat. One would assume that the first phase of the curve represents the 'real' signal related to biological differences between cell populations, while the second phase mostly represents technical variation or the stochastic nature of individual cells. To that perspective, choosing the top-15 PCs is probably good and PCs ranked lower than 20 look quite unnecessary. However, even though this is a pretty good reference, it is far from perfect:
+
+It is very difficult to precisely define the elbow point or turning point of the curve, as it is usually not a perfect elbow.
+Higher-ranked PCs do explain more variation than lower-ranked PCs, but more explained variations does not necessarily mean higher information content. Sometimes there is interesting but weak signal buried in the noise and therefore as part of lower-ranked PCs.
+There is another procedure implemented in Seurat called JackStraw which can also help to identify how many PCs to consider for the following analysis. However, in our experience this procedure is very slow because it relies on data permutation and it essentially does not provide much more information than the elbow plot. What it does is to estimate statistical significance of each PC, but similarly, a 'significant' PC doesn't mean it is informative. And when cell number increases, more and more PCs become statistically 'significant' even though their explained variation is not substantial. People interested in this method can take a look at the Seurat vignette.
+
+Apart from making an unbiased decision, one can also check which genes are mostly contributing to each of the top PCs . This can be informative if one knows the genes and the biology of the analyzed sample. It provides the opportunity to understand the biological implication of each of the top PCs, so that one can pick those representing useful information.
+
+```{r}
+PCHeatmap(seurat, dims = 1:20, cells = 500, balanced = TRUE, ncol = 4)
+```
+Please be aware that it is not recommended to choose ONLY PCs represented by the "interesting" genes. There is a huge chance one misses interesting but unexpected phenomena by doing that.
+
+In this example, we would use the top-20 PCs for the following analysis. Again, it is absolutely fine to use more or fewer PCs, and in practice this sometimes needs some iteration to make the final decision. Meanwhile, for most of the data, a PC number ranging from 10 to 50 would be reasonable and in many cases it won't affect the conclusion very much (but sometimes it will, so still be cautious).
+
+### Non-linear dimension reduction for visualization
+
+A linear dimension reduction has both pros and cons. The good side is that every PC is a linear combination of gene expression so interpretation of PCs are straightforward. Also the data is compressed but not disorted, therefore information in the data is largely remained. The bad side, on the other hand, is that one usually needs more than 10 PCs to cover most of the information. This is fine for most of the analysis, but not for visualization where it is impossible to go over three dimensions for ordinary persons.
+
+To overcome this issue, non-linear dimension reductions is introduced. The most commonly used non-linear dimension reduction methods in scRNA-seq data analysis are t-distributed Stochastic Neighbor Embedding (t-SNE) and Uniform Manifold Approximation and Projection (UMAP). Both methods try to place every sample in a low-dimensional space (2D/3D), so that distances or neighborhood relationships between different samples (here cells) in the original space are largely retained in the low-dimensional space. The detailed mathematically descriptions of the two methods are out of the scope of this tutorial, but for those who are interested in, you may check this video for tSNE, and this blog of Nikolay Oskolkov for UMAP. There are also more methods to create other low-dimensional embeddings for visualization, including but not limiting to SPRING, PHATE. Now let's focus on tSNE and UMAP which Seurat has included. The top PCs in the PCA analysis are used as the input to create a tSNE and UMAP embedding of the data. 
+
+```{r}
+seurat <- RunTSNE(seurat, dims = 1:20)
+seurat <- RunUMAP(seurat, dims = 1:20)
+```
+
+P.S. technically one can directly use the scaled expression of highly variable genes for these. It is however not recommended, as it is much slower and probably more noisy.
+
+The results can be then visualized.
+
+```{r}
+plot1 <- TSNEPlot(seurat)
+plot2 <- UMAPPlot(seurat)
+plot1 + plot2
+```
+It is a hot topic whether tSNE or UMAP is superior to the other (for instance, this blog of Nikolay Oskolkov and this paper by Kobak and Linderman). To our experience, they both have their pros and cons and neither always work better than the other one. TSNE provides great visualization when cells form distinct cell groups, while UMAP perserves trajectory-like structure better when data contains 'continuum', e.g. the continuous cell state change during development and differentiation. It is therefore good to try both, and choose the one works better for your data.
+
+Once the tSNE or UMAP embedding is created, one can start to check whether certain cell types or cell states exist in the data, by doing feature plots of some known canonical markers of the cell types of interest.
+
+```{r}
+library(patchwork)
+plot1 <- FeaturePlot(seurat, c("MKI67","NES","DCX","FOXG1","DLX2","EMX1","OTX2","LHX9","TFAP2A"),
+                     ncol=3, reduction = "tsne")
+plot2 <- FeaturePlot(seurat, c("MKI67","NES","DCX","FOXG1","DLX2","EMX1","OTX2","LHX9","TFAP2A"),
+                     ncol=3, reduction = "umap")
+plot1 / plot2
+```
+P.S. with patchwork imported, plot1 / plot2 generates the plotting layout that plot1 is put above plot2.
+
+For people who are not familiar with those genes:
+
+MKI67: a marker of G2M phase of cell cycle
+NES: a neural progenitor marker
+DCX: a pan-(immature) neuron marker
+FOXG1: a telencephalon marker
+DLX2: a ventral telencephalon marker
+EMX1: a dorsal telencephalon (cortex) marker
+OTX2: a midbrain and diencephalon neuron marker
+LHX9: a diencephalon and midbrain neuron marker
+TFAP2A: a midbrain-hindbrain boundary marker
+So now we have some idea about what kinds of cells exist in this data.
+
+### Cluster the cells 
+
+Doing feature plot of markers is usually a good way to start with when exploring scRNA-seq data. However, to more comprehensively understand the underlying heterogeneity in the data, it is necessary to identify cell groups with an unbiased manner. This is what clustering does. In principle, one can apply any clustering methods, including those widely used in bulk RNA-seq data analysis such as hierarchical clustering and k-means, to the scRNA-seq data. However, in practice, this is very difficult, as the sample size in scRNA-seq data is too much larger (one 10x experiment usually gives several thousands of cells). It would be extremely slow to use these methods. In addition, due to the intrinsic sparseness of scRNA-seq data, even if data is denoised by dimension reduction like PCA, differences between different cells are not as well quantitative as those of bulk RNA-seq data. Therefore, the more commonly used clustering methods in scRNA-seq data analysis is graph-based community identification algorithm. Here, graph is the mathematical concept, where there is a set of objects, and some pairs of these objects are related with each other; or in a simplified way, a network of something, and here, a network of cells.
+
+First of all, a k-nearest neighbor network of cells is generated. Every cells is firstly connected to cells with the shortest distances, based on their corresponding PC values. Only cell pairs which are neighbors of each other are considered as connected. Proportion of shared neighbors between every cell pairs is then calculated and used to describe the strength of the connection between two cells. Weak connections are trimmed. This gives the resulted Shared Nearest Neighbor (SNN) network. In practice, this is very simple in Seurat.
+
+
+```{r}
+seurat <- FindNeighbors(seurat, dims = 1:20)
+```
+With the network constructed, the louvain community identification algorithm is applied to the netowkr to look for communities in the network, i.e. cell groups that cells in the same group tend to connect with each other, while connections between cells in different groups are sparse.
+
+```{r}
+seurat <- FindClusters(seurat, resolution = 1)
+```
+Here, the resolution parameter is used to control whether the major and coarsed cell groups (e.g. major cell types), or the smaller but finer cell groups are returned (e.g. cell subtypes). The commonly used resolution ranges between 0.1 and 1, and which is the best option largely depends on the aim of the analysis. Here, a high resolution parameter is used to get a finer clustering. One can run multiple times of the FindClusters function with different resolutions. The newest clustering result can be obtained by Idents(seurat) or seurat@active.ident. Other clustering results are also stored, as different columns in the meta.data slot (seurat@meta.data)
+
+Next is to visualize the clustering result using the tSNE and UMAP embeddings that are generated before.
+
+```{r}
+plot1 <- DimPlot(seurat, reduction = "tsne", label = TRUE)
+plot2 <- DimPlot(seurat, reduction = "umap", label = TRUE)
+plot1 + plot2
+```
+### Annotate cell clusters
+
+Clustering the cells gives a identity label to each cell, and we can assume that cells with the same label are similar to each other and therefore can be seen to be of the same cell type or cell state. The next question is which exact cell types or cell states these cell clusters are representing. This is not an easy question to answer, and usually there is no perfect answer. There are several options one can try to resolve this issue. For instance,
+
+Check the expression of canonical cell type and cell state markers in these clusters;
+Identify signature genes, or marker genes, of each identified cell cluster. Based on the identified cluster marker genes, one can do literature search, enrichment analysis or do experiment (or ask people around) for annotation;
+For each cluster, compare its gene expression profile with existing reference data.
+Obviously, the first method requires some prior knowledge of the system being measured. One needs to have a list of convincing markers which are well accepted by the field. Particularly for the system of the example data set (cerebral organoid), some of the markers have been listed above. A longer list (never being complete though) includes
+
+NES / SOX2: NPC marker
+NHLH1: neuroblast (new-born neuron) marker
+DCX / MAP2 / MAPT: neuron marker
+FOXG1: telencephalon marker
+EMX1 / EMX2: dorsal telencephalon (cortical) marker
+EOMES: cortical intermediate progenitor (IP, proliferating neuroblast) marker
+NEUROD6 / SLC17A7: dorsal telencephalic (cortical) glutamatergic neuron marker
+BCL11B: deeper layer cortical neuron marker
+SATB2: upper layer cortical neuron marker
+RELN: Cajal-Retzius cell marker
+DLX2 / DLX5: ganglionic eminence (GE) marker
+ISL1: lateral ganglionic eminence (LGE) inhibitory neuron marker
+NKX2-1: medial ganglionic eminence (MGE) inhibitory neuron marker
+RSPO3 / TCF7L2 / LHX5 / LHX9: diencephalon marker (for different neuron subtypes)
+OTX2 / LMX1A / EN1: midbrain marker (for different neuron subtypes)
+CYP26A1: Purkinje cell (cerebellar) progenitor marker
+TFAP2A / CA8: Purkinje cell marker
+HOXB2 / HOXB5: hindbrain (medulla/pons) and spinal cord marker
+SLC17A6: glutamatergic neuron marker
+SLC32A1 / GAD1 / GAD2: GABAergic neuron marker
+TH: doparminergic neuron marker
+CHAT / ACHE: cholinergic neuron marker
+TTR: choroid plexus marker
+GFAP / AQP4 / S100B: astrocyte marker
+OLIG1: oligodendrocyte precursor cell marker
+MBP / SOX10: ologodendrocyte marker
+SOX10: neural crest derivative marker
+AIF1: microglia marker
+CLDN5: endothelial cell marker
+DCN: mesenchymal cell marker
+MKI67: cell cycle G2M phase marker (proliferative cells)
+
+P.S. Be careful! Many of those genes are not only expressed in the listed cell types. For instance, many ventral telen. neurons also express BCL11B, which is a famous deeper layer cortical neuron marker. Therefore, when doing the annotation, one needs to look at combinations of markers. For instance, only if the BCL11B+ cells also express EMX1 and NEUROD6, they would be annotated as deeper layer cortical neurons.
+
+The easiest to visualize expression of marker genes of interest across cell clusters is probably by a heatmap.
+
+```{r}
+ct_markers <- c("MKI67","NES","DCX","FOXG1", # G2M, NPC, neuron, telencephalon
+                "DLX2","DLX5","ISL1","SIX3","NKX2.1","SOX6","NR2F2", # ventral telencephalon related
+                "EMX1","PAX6","GLI3","EOMES","NEUROD6", # dorsal telencephalon related
+                "RSPO3","OTX2","LHX9","TFAP2A","RELN","HOXB2","HOXB5") # non-telencephalon related
+DoHeatmap(seurat, features = ct_markers) + NoLegend()
+```
+
+Next, in order to do annotation in a more unbiased way, we should firstly identify cluster markers for each of the cell cluster identified. In Seurat, this can be done using the FindAllMarkers function. What it does is for cell cluster, to do differential expression analysis (with Wilcoxon's rank sum test) between cells in the cluster and cells in other clusters.
+
+```{r}
+cl_markers <- FindAllMarkers(seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = log(1.2))
+library(dplyr)
+cl_markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_log2FC)
+```
+Because of the nature of large sample size in scRNA-seq data (one cell is one sample), it is strongly recommended to not only look at p-values, but also detection rate of the gene in the cluster (pct) and fold change (logfc) between cells in and outside the cluster. That's why there are options min.pct and logfc.threshold in the function to require threshold on the effect size.
+
+P.S. you need to have dplyr package installed and imported to use the pipe feature. Alternatively, one can use the old-school lapply combinations, e.g. do.call(rbind, lapply(split(cl_markers, cl_markers$cluster), function(x) x[order(x$avg_logFC, decreasing=T)[1:2],])), but probably not many people like it.
+
+You may have felt that this process takes quite a while. There is a faster solution by the other package called "presto".
+
+```{r}
+library(presto)
+cl_markers_presto <- wilcoxauc(seurat)
+cl_markers_presto %>%
+    filter(logFC > log(1.2) & pct_in > 20 & padj < 0.05) %>%
+    group_by(group) %>%
+    arrange(desc(logFC), .by_group=T) %>%
+    top_n(n = 2, wt = logFC) %>%
+    print(n = 40, width = Inf)
+```
+P.S. The latest presto requires DESeq2 to be installed. If you think Wilcoxon test is sufficient, an older version of presto would be enough. Do it by devtools::install_github("immunogenomics/presto", ref = "4b96fc8").
+
+The presto output is very similar to the native solution of Seurat, but with some additional metrics.
+
+No matter with which method, the identified top cluster markers can be next visualized by a heatmap
+
+```{r}
+top10_cl_markers <- cl_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+DoHeatmap(seurat, features = top10_cl_markers$gene) + NoLegend()
+```
+One can also check those markers of different clusters in more details, by doing feature plot or violin plot for them. For instance, we can use NEUROD2 and NEUROD6 as very strong markers of cluster 2, so let's take a closer look.
+
+```{r}
+plot1 <- FeaturePlot(seurat, c("NEUROD2","NEUROD6"), ncol = 1)
+plot2 <- VlnPlot(seurat, features = c("NEUROD2","NEUROD6"), pt.size = 0)
+plot1 + plot2 + plot_layout(widths = c(1, 2))
+```
+So it seems that NEUROD2 and NEUROD6 are not only highly expressed in cluster 2, but also in cluster 6. And if you still remember where these clusters are in the tSNE/UMAP embedding, you will find that these two clusters are next to each other, suggesting that they may represent cell types related to each other and both show strong dorsal telencephalon identity. Their separation likely represents their maturity states. Neurons in cluster 6 is probably less mature as they are connected to cluster 0, which is likely dorsal telencephalic NPCs. In addition, cluster 6 show high expression of EOMES, a dorsal telencephalic IP marker. Taken them all together, we can quite confidently say, that cluster 0, 6, and 2 all represent dorsal telencephalic cells, cluster 0 is the progenitors, cluster 6 is the intermediate progenitors and cluster 2 is the neurons.
+
+If we look at the other side of cluster 0, there is cluster 5 connected, and then it is cluster 10. Now look at the heatmap again, you will find that although they have their distinct markers and expression patterns, they all present similar signatures of dorsal telencephalic NPCs. On top of it, cells in cluster 5 and cluster 10 show high expression of cell cycle G2M phase markers. This suggests that cluster 5 and cluster 10 are also dorsal telencephalic NPCs, and their separation from cluster 0 is likely due to their difference on cell cycle phases.
+
+Interesting, all these cells in cluster 10, 5, 0, 6 and 2 form a trajectory-like structure in the UMAP. It likely reflects the differentiation and neuron maturation process. We will come back to this soon.
+
+This is how cell cluster annotation is usually done. You may feel it too subjective and too much rely on personal judgement. In that case, there are also more objective and unbiased ways to do automated or semi-automated annotation. There are tools emerging, such as Garnett developed by Cole Trapnell's lab, and Capybara developed by Samantha Morris' lab. These tools use similar strategy, to firstly standarize cell type annotations of existing scRNA-seq data, train one or multiple prediction model using the annotated data, and then apply the models to a new data set for the automated annotation. Currently, those tools have limitations. Their application is usually limited to major cell types of commonly studied organs, and their performance largely depends on data and annotation quality of the training data sets. Details of using these tools won't be discussed here, but for people who are interested, it is good to try.
+
+It is worth to mention that one doesn't always need to use a complex machine learning model trained on other scRNA-seq data to assist annotation of cell clusters. Caculating correlations of gene expression profiles of cells or cell clusters in the scRNA-seq data to those of bulk references can also be very informative. One example is VoxHunt developed by our group, which correlates expression profiles of cells or cell clusters to the in situ hybridization atlas of developing mouse brain in Allen Brain Atlas. This can be very helpful for annotating scRNA-seq data of cerebral organoid samples.
+
+P.S. To do this the voxhunt package needs to be installed first. Please follow the instruction on the page and don't forget to also download the ABA ISH data, which also has a link on the page. Replace ABA_data below by the path towards the folder of the downloaded data.
+
+```{r}
+library(voxhunt)
+load_aba_data('ABA_data')
+genes_use <- variable_genes('E13', 300)$gene
+vox_map <- voxel_map(seurat, genes_use=genes_use)
+plot_map(vox_map)
+```
+
+From the projection we can also make similar conclusion, that cluster 10, 5, 0, 6 and 2 are belong to dorsal telencephalon. At the end, we can do a rough annotation for all clusters.
+
+We can replace the cell cluster labels by the annotation, but this is optional
+
+```{r}
+new_ident <- setNames(c("Dorsal telen. NPC",
+                        "Midbrain-hindbrain boundary neuron",
+                        "Dorsal telen. neuron",
+                        "Dien. and midbrain excitatory neuron",
+                        "MGE-like neuron","G2M dorsal telen. NPC",
+                        "Dorsal telen. IP","Dien. and midbrain NPC",
+                        "Dien. and midbrain IP and excitatory early neuron",
+                        "G2M Dien. and midbrain NPC",
+                        "G2M dorsal telen. NPC",
+                        "Dien. and midbrain inhibitory neuron",
+                        "Dien. and midbrain IP and early inhibitory neuron",
+                        "Ventral telen. neuron",
+                        "Unknown 1",
+                        "Unknown 2"),
+                      levels(seurat))
+seurat <- RenameIdents(seurat, new_ident)
+DimPlot(seurat, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+### Pseudotemporal cell ordering 
+
+We finally move to the next step. As mentioned above, the trajectory-like structure formed by cells in the dorsal telencephalon clusters we can see in the UMAP embedding likely represents differentiation and maturation of dorsal telencephalic excitatory neurons. This is likely a continuous process, and therefore it is more proper to consider it as a continuous trajectory rather than distinct clusters. In that case, it is more informative to perform so-called pseudotemporal cell ordering, or pseudotime analysis on those cells.
+
+So far, there are quite a lot of different methods for pseudotime analysis. Commonly used methods include diffusion map (implemented in destiny package in R) and monocle. Here, we will show the example of using destiny to do pseudotime analysis on the dorsal telencephalic cells in the data. The mathematics of diffusion map and diffusion pseudotime (dpt) is out of the scope of this tutorial, but for those who are interested, please refer to the DPT paper by Fabian Theis's lab.
+
+First of all, cells of interest are extracted. Afterwards, we re-identify highly variable genes for the subset cells, as genes representing differences between dorsal telencephalic cells and other cells are no longer informative.
+
+```{r}
+seurat_dorsal <- subset(seurat, subset = RNA_snn_res.1 %in% c(0,2,5,6,10))
+seurat_dorsal <- FindVariableFeatures(seurat_dorsal, nfeatures = 2000)
+```
+
+P.S. if you are sure that the clustering result you want to use to subset cells is the newest one, using seurat_dorsal <- subset(seurat, idents = c(0,2,5,6,10)) gives you the same result. With this way it looks for cells in the active clustering result in the Seurat object, which is stored as seurat@active.ident. In the metadata table (seurat@meta.data), there is also a column called seurat_clusters which shows the newest clustering result, and is updated every time when a new clustering is done. However, be careful. In real world when many iterations of parameter tryings are done, it is very common that one gets lost. So if you want to do it in this way, double check before doing the subset, to make sure that the active clustering result is the one to use.
+
+As you may have noticed, there are two clusters of dorsal telencephalic NPCs separated from the third cluster because they are at different phase of cell cycle. Since we are interested in the general molecular changes during differentiation and maturation, the cell cycle changes may strongly confound the analysis. We can try to reduce cell cycle effect by excluding cell cycle related genes from the identified highly variable gene list.
+
+```{r}
+VariableFeatures(seurat) <- setdiff(VariableFeatures(seurat), unlist(cc.genes))
+```
+
+P.S. cc.genes is a list that is automatically imported by Seurat when the package is imported. It includes genes reported in this paper.
+
+We can then check how the data look like, by creating a new UMAP embedding and do some feature plots.
+
+```{r}
+seurat_dorsal <- RunPCA(seurat_dorsal) %>% RunUMAP(dims = 1:20)
+FeaturePlot(seurat_dorsal, c("MKI67","GLI3","EOMES","NEUROD6"), ncol = 4)
+```
+
+Not so great. The G2M cells are no longer in separated clusters, but it still confounds the cell type differentiation trajectory. For instance, EOMES+ cells are distributed separately in two groups. We need to further reduce the cell cycle effect.
+
+As briefly mentioned above, the ScaleData function has the option to include variables representing sources of unwanted variations. We can try to use that to further reduce the cell cycle influence; but before that, we need to generate cell-cycle-related scores for every cell to describe their cell cycle status.
+
+```{r}
+seurat_dorsal <- CellCycleScoring(seurat_dorsal,
+                                  s.features = cc.genes$s.genes,
+                                  g2m.features = cc.genes$g2m.genes,
+                                  set.ident = TRUE)
+seurat_dorsal <- ScaleData(seurat_dorsal, vars.to.regress = c("S.Score", "G2M.Score"))
+```
+We can then check how the data look like, by creating a new UMAP embedding and do some feature plots
+
+```{r}
+seurat_dorsal <- RunPCA(seurat_dorsal) %>% RunUMAP(dims = 1:20)
+FeaturePlot(seurat_dorsal, c("MKI67","GLI3","EOMES","NEUROD6"), ncol = 4)
+```
+It is not perfect, but at least we no longer see two separated EOMES+ groups.
+
+Now let's try to run diffusion map to get the cells ordered.
+
+```{r}
+library(destiny)
+dm <- DiffusionMap(Embeddings(seurat_dorsal, "pca")[,1:20])
+dpt <- DPT(dm)
+seurat_dorsal$dpt <- rank(dpt$dpt)
+FeaturePlot(seurat_dorsal, c("dpt","GLI3","EOMES","NEUROD6"), ncol=4)
+```
+P.S. Here the rank of the estimated dpt, instead of the dpt itself, is used as the final pseudotime. Both options have pros and cons. In principle, the raw dpt contains not only the ordering, but also how big the difference is. However, its value range is usually dominated by some 'outliers' on both sides which are less represented by the data. Using the rank helps to restore those changes at medium dpt. Feel free to try both.
+
+P.S. Unlike the example here where NPCs have smaller pseudotime, it is possible that one gets a pseudotime series starting from neuron. This is because diffusion pseudotime, as well as most of other similarity-based pseudotime analysis methods, is undirected. It estimates the gradient but doesn't know which end is the source if you don't tell it. Therefore, if you find the constructed pseudotime goes to the wrong direction, flip it (e.g. seurat_dorsal$dpt <- rank(-dpt$dpt))
+
+To visualize expression changes along the constructed pseudotime, a scatter plot with fitted curve is usually a straightforward way.
+
+```{r}
+if (is(seurat_dorsal[['RNA']], 'Assay5')){
+    expr <- LayerData(seurat_dorsal, assay = "RNA", layer = "data")
+} else{
+    expr <- seurat_dorsal[['RNA']]@data
+}
+
+library(ggplot2)
+plot1 <- qplot(seurat_dorsal$dpt, as.numeric(expr["GLI3",]),
+               xlab="Dpt", ylab="Expression", main="GLI3") +
+         geom_smooth(se = FALSE, method = "loess") + theme_bw()
+plot2 <- qplot(seurat_dorsal$dpt, as.numeric(expr["EOMES",]),
+               xlab="Dpt", ylab="Expression", main="EOMES") +
+         geom_smooth(se = FALSE, method = "loess") + theme_bw()
+plot3 <- qplot(seurat_dorsal$dpt, as.numeric(expr["NEUROD6",]),
+               xlab="Dpt", ylab="Expression", main="NEUROD6") +
+         geom_smooth(se = FALSE, method = "loess") + theme_bw()
+plot1 + plot2 + plot3
+```
+
+P.S. The recent Seurat upgrade (v5) introduces a new and more flexible data structure for assay data (Assay5 class), which is fundamentally different from the previous Array class. This is why in the above codes we have to firstly check whether the RNA assay is stored as an Assay5 object or not.
+
+### Save the result
+
+These are basically everything in the Part 1 of this tutorial, covering most of the basic analysis one can do to a single scRNA-seq data set. At the end of the analysis, we of course wants to save the result, probably the Seurat object we've played around with for a while, so that next time we don't need to rerun all the analysis again. The way to save the Seurat object is the same as saving any other R object. One can either use saveRDS/readRDS to save/load every Seurat object separately,
+
+```{r}
+saveRDS(seurat, file="DS1/seurat_obj_all.rds")
+saveRDS(seurat_dorsal, file="DS1/seurat_obj_dorsal.rds")
+
+seurat <- readRDS("DS1/seurat_obj_all.rds")
+seurat_dorsal <- readRDS("DS1/seurat_obj_dorsal.rds")
+```
+
+or use save/load to save multiple objects together
+
+```{r}
+save(seurat, seurat_dorsal, file="DS1/seurat_objs.rdata")
+load("DS1/seurat_objs.rdata")
+```
+
+### What else?
+
+There are of course more one can do, but it is impossible to involve everything here. One of them is RNA velocity analysis (see this paper). This is a very cool concept jointly proposed by Sten Linnarsson's lab and Peter Kharchenko's lab, that while the exonic transcriptome represents the current state of a cell, the intronic transcriptome represents what the cell is going to be in the near future. By introducing a transcriptional dynamic model, RNA velocity analysis predicts the directional 'flow' of cell state transition, which greatly expands the application of scRNA-seq to capture dynamics of molecular changes. Fabian Theis's lab further improved the method by introducing a better transcriptional dynamic model and implemented scVelo, which is faster and more accurate than the original velocyto, and can do more analysis including estimating the directional velocity pseudotime.
+
+Branching point analysis can be also interesting and informative. Particularly in many differentiation- or development-related systems, one stem cell can specify its fate into one of multiple possible options. This decision process can be in principle captured by scRNA-seq data, if the sample contains cells before fate specification and cells in all the specified fates. Branching point analysis is to identify the point on the cell fate specification trajectory where cell fate specification happens, so that one can get the cell fate specification tree or network. PAGA and monocle are among the most widely used tools for this purpose. Another related analysis is to estimate fate bias in multipotent progenitors. FateID developed by Dominic Gruen's lab is a tool for such an analysis.
+
+There are also some more specific and detailed statistical analysis, e.g. to identify genes with significant expression changes along the pseudotime. Many of them may not have any good tool or algorithm available. What's described in this tutorial is just the beginning. To master the analysis of scRNA-seq data, we shall all never stop learning, and never stop innovating.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,401 @@
+---
+title: "scATAC-seq Workflow (Signac)"
+author: "Layaa Sivakumar"
+date: "2025-09-20"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data
+
+Using dataset specified in the Signac vignette:
+
+```         
+wget https://cf.10xgenomics.com/samples/cell-atac/2.1.0/10k_pbmc_ATACv2_nextgem_Chromium_Controller/10k_pbmc_ATACv2_nextgem_Chromium_Controller_filtered_peak_bc_matrix.h5
+wget https://cf.10xgenomics.com/samples/cell-atac/2.1.0/10k_pbmc_ATACv2_nextgem_Chromium_Controller/10k_pbmc_ATACv2_nextgem_Chromium_Controller_singlecell.csv
+wget https://cf.10xgenomics.com/samples/cell-atac/2.1.0/10k_pbmc_ATACv2_nextgem_Chromium_Controller/10k_pbmc_ATACv2_nextgem_Chromium_Controller_fragments.tsv.gz
+wget https://cf.10xgenomics.com/samples/cell-atac/2.1.0/10k_pbmc_ATACv2_nextgem_Chromium_Controller/10k_pbmc_ATACv2_nextgem_Chromium_Controller_fragments.tsv.gz.tbi
+```
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(EnsDb.Hsapiens.v75)
+
+```
+
+```{r}
+path = "C:\\Users\\layaa\\Documents\\2025\\professional-dev\\signac-vignette-data"
+```
+
+## What is a fragment file? How is it generated?
+
+```{r}
+frag.file = read.delim(file.path(path, "10k_pbmc_ATACv2_nextgem_Chromium_Controller_fragments.tsv.gz"), header=F, nrow=10)
+head(frag.file)
+
+```
+
+## Load data
+
+```{r}
+counts = Read10X_h5(filename = file.path(path, "10k_pbmc_ATACv2_nextgem_Chromium_Controller_filtered_peak_bc_matrix.h5"))
+counts[1:10, 1:10]
+
+```
+
+This is a sparse matrix--only non-zero values are stored. Here, the features are the regions of predicted open chromatin (peaks). The number in the matrix represent the number of Tn5 integration sites that map to each chromatic region in each cell.
+
+Let's create a ChromatinAssay object using the counts data now, we will set the `min.cells=10` (includes only those features that are detected in at least 10 cells) and `min.features=200` (includes only those cells with at least 200 features detected).
+
+```{r}
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  fragments = file.path(path, "10k_pbmc_ATACv2_nextgem_Chromium_Controller_fragments.tsv.gz"),
+  min.cells = 10,
+  min.features = 200
+)
+
+str(chrom_assay)
+
+```
+
+```{r}
+metadata <- read.csv(
+  file = file.path(path, "10k_pbmc_ATACv2_nextgem_Chromium_Controller_singlecell.csv"),
+  header = T,
+  row.names = 1
+  )
+head(metadata)
+```
+
+The metadata shows the number of reads in each of the cells that are duplicated, chimeric, unmapped, in different regions of the chromatin, etc. Some of these values will be used in the QC that we will perform in this workflow. In this dataset, this metadata file was generated with CellRanger, but if not provided, it can also be generated using the Signac package (see full vignette).
+
+```{r}
+pbmc <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "atac",
+  meta.data = metadata
+)
+
+str(pbmc)
+```
+
+### Adding gene annotations
+
+Currently, the `annotation` slot within `atac` is NULL. This is where the annotations that we'll add will be stored.
+
+```{r}
+pbmc@assays$atac@annotation
+
+```
+
+```{r}
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v75)
+
+```
+
+This has the chromosome locations of transcripts. We have to change the format of the `seqnames` column a little to make it compatible with `Signac`. Specifically, we need to add the `chr` prefix to these entries.
+
+```{r}
+# seqlevels() allows access and modification of sequence info stored in an object
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+
+```
+
+Now, we add this to our Seurat object:
+
+```{r}
+Annotation(pbmc) <- annotations
+pbmc@assays$atac@annotation
+```
+
+As you can see, now the `annotations` slot in the `pbmc` object is filled with the gene annotation information we added.
+
+## Computing QC
+
+```{r}
+# compute nucleosome signal score per cell 
+pbmc <- NucleosomeSignal(pbmc)
+
+pbmc <- TSSEnrichment(object = pbmc, fast = F)
+
+pbmc$blacklist_ratio <- pbmc$blacklist_region_fragments / pbmc$peak_region_fragments
+
+pbmc$pct_reads_in_peaks <- pbmc$peak_region_fragments / pbmc$passed_filters * 100
+
+head(pbmc@meta.data)
+
+```
+
+## Visualizing QC
+
+```{r}
+plt1 <- DensityScatter(pbmc, x="nCount_atac", y="TSS.enrichment", log_x=T, quantiles=T)
+
+plt2 <- DensityScatter(pbmc, x="nucleosome_signal", y="TSS.enrichment", log_x=T, quantiles=T)
+
+plt1 | plt2
+
+```
+
+```{r}
+VlnPlot(object = pbmc, features = c('nCount_atac', 'nFeature_atac', 'TSS.enrichment', 'nucleosome_signal', 'blacklist_ratio', 'pct_reads_in_peaks'),
+        pt.size=0.1,
+        ncol=6)
+
+```
+
+## Filtering poor quality cells
+
+```{r}
+pbmc <- subset(x=pbmc,
+               subset = nCount_atac > 9000 &
+                 nCount_atac < 100000 &
+                 pct_reads_in_peaks > 40 &
+                 blacklist_ratio < 0.1 &
+                 nucleosome_signal < 4 &
+                 TSS.enrichment > 2)
+
+```
+
+## Normalization and linear dimensionality reduction
+
+### Normalization
+
+Normalization of scATAC-seq data is necessary to handle these common pitfalls of this data/experimental process:
+
+1.  **Correct for technical variability:**
+
+-   Each cells can have a different number of total fragments due to sequencing depth, transposition efficiency or PCR amplification.
+-   Normalize to ensure that cells with more reads don't dominate the analysis. Otherwise, a highly sequenced cell may appear to have more chromatin than the other just due to technical reasons.
+-   This also makes the cells directly comparable since they will be on a common scale.
+
+2.  **Account for sparsity**
+
+-   Most peaks have 0 counts in any given cell.
+-   Sparse nature of this data introduces many issues:
+    -   False negatives: absence of signal (0s) doesn't imply biological absence. It could've not been captured due to low sequencing depth, transposase didn't insert in that spot, or the fragment didn't pass filtering.
+    -   Harder to estimate distributions; fewer observations (non-zero) per peak/cell --\> more sampling noise, leading to greater variability across features and weaker clustering.
+    -   Overemphasizes rare events: single non-zero count stands out much more and can get over-interpreted as signal during clustering/dim red when it may have been technical noise.
+    -   Harder to distinguish real biological variance: if a gene/region is truly differentially accessible but has low coverage, the difference might be masked by random dropout. On the other hand, technical noise can look like real difference.
+-   Need normalization to reduce noise and emphasize meaningful patterns.
+
+3.  **Reduce influence of non-informative peaks**
+
+-   Some regions are open in all cells i.e., promoters of housekeeping genes. These are not interesting in that they don't help distinguish cell types.
+-   Term Frequency-Inverse Document Frequency (TF-IDF) downweights these peaks, allowing better detection of cell-type-specific signals.
+
+Here, the cell-by-peak matrix is normalized using TF-IDF. This normalizes each cell by its total read count and downweights peaks that are accessible in many cells (non-cell-specific). Then, singular value decomposition (SVD) is used for dimensionality reduction on the TF-IDF-normalized matrix. The output of this is analogous to PCA in scRNA-seq analysis workflow. The combined steps of TF-IDF followed by SVD are known as latent semantic indexing (LSI).
+
+### Feature selection
+
+Can't perform variable feature selection on this data because of low dynamic ranger. Instead, we can either choose the top n% of peaks (i.e., those peaks that are most frequently accessible), or remove peaks that are accessible in fewer than n cells using `FindTopFeatures()`.
+
+```{r}
+pbmc <- RunTFIDF(pbmc)
+
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q75') # uses top 25% of all peaks
+
+pbmc <- RunSVD(pbmc)
+
+```
+
+```{r}
+DepthCor(pbmc)
+
+```
+
+This plot shows the correlation of each component with sequencing depth. The first component shows high correlation. Thus, it will be excluded from downstream analysis.
+
+## Non-linear dimensionality reduction and clustering
+
+```{r}
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 2:30)
+
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 2:30)
+
+pbmc <- FindClusters(object = pbmc, verbose=F, algorithm = 3)
+
+```
+
+```{r}
+DimPlot(object = pbmc, label = T) + NoLegend()
+
+```
+
+## Gene activity matrix
+
+We can quantify how active a gene is (i.e., whether is it being transcribed a lot) by determining how many of the peaks belong to the gene body and promoter region. This is what a gene activity matrix represents. It sums all the fragments/peaks falling within known gene regions per cell.
+
+### Create the gene activity matrix
+
+```{r}
+gene.activities <- GeneActivity(pbmc)
+gene.activities[1:10, 1:10]
+
+```
+
+### Add the matrix to Seurat object as a new assay and normalize it
+
+```{r}
+pbmc[['RNA']] <- CreateAssayObject(counts = gene.activities)
+pbmc@assays
+
+```
+
+```{r}
+NormalizeData(object = pbmc,
+              assay = 'RNA',
+              normalization.method = 'LogNormalize',
+              scale.factor = median(pbmc$nCount_RNA))
+
+```
+
+### Visualize canonical markers
+
+One way to annotate clusters in the scATAC-seq data is visualizing expression of known cell-type specific marker genes (if that information is known about the dataset). In this case, we look at markers that distinguish different PBMC cell types:
+
+```{r}
+# set the default assay to RNA
+DefaultAssay(pbmc) <- 'RNA'
+
+FeaturePlot(object = pbmc,
+            features = c('MS4A1', 'CD3D', 'LEF1', 'NKG7', 'TREM1', 'LYZ'),
+            pt.size = 0.1,
+            max.cutoff = 'q95',
+            ncol = 3)
+
+```
+
+## Integrate scATAC-seq data with scRNA-seq data
+
+```{r}
+pbmc_rna <- readRDS(file.path(path, 'pbmc_10k_v3.rds'))
+pbmc_rna <- UpdateSeuratObject(pbmc_rna)
+head(pbmc_rna)
+
+```
+
+This is a preprocessed scRNA-seq dataset of PBMC samples. The annotations for each cell are present in the `celltype` column.
+
+Here are their UMAPs before integration:
+
+```{r}
+p1 <- DimPlot(object = pbmc, reduction = 'umap') + NoLegend() + ggtitle("scATAC-seq")
+p2 <- DimPlot(object = pbmc_rna, reduction = 'umap', group.by = 'celltype', repel = T, label = T) + NoLegend() + ggtitle("scRNA-seq")
+
+p1 | p2
+
+```
+
+### Transfer anchors with Seurat
+
+```{r}
+transfer.anchors <- FindTransferAnchors(reference = pbmc_rna,
+                                        query = pbmc,
+                                        reduction = 'cca') # CCA is very slow
+
+predicted.labels <- TransferData(anchorset = transfer.anchors,
+                                 refdata = pbmc_rna$celltype,
+                                 weight.reduction = pbmc[['lsi']],
+                                 dims = 2:30)
+head(predicted.labels)
+
+```
+
+```{r}
+pbmc <- AddMetaData(object = pbmc,
+                    metadata = predicted.labels)
+
+head(pbmc@meta.data)
+
+```
+
+Let's visualize the clusters again side by side with our predicted labels for scATAC-seq now:
+
+```{r}
+p1 <- DimPlot(object = pbmc, reduction = 'umap', group.by = 'predicted.id', repel=T, label=T) + NoLegend() + ggtitle("scATAC-seq")
+p2 <- DimPlot(object = pbmc_rna, reduction = 'umap', group.by = 'celltype', repel=T, label=T) + NoLegend() + ggtitle("scRNA-seq")
+
+p1 | p2
+
+```
+
+## Finding differentially accessible peaks between cell types
+
+```{r}
+Idents(pbmc)[1:10] # need to switch these identities from cluster number to predicted.id
+
+Idents(pbmc) <- pbmc$predicted.id
+
+```
+
+```{r}
+# change default assay to atac again
+DefaultAssay(pbmc) <- 'atac'
+
+da_peaks <- FindMarkers(object = pbmc,
+            ident.1 = 'pDC',
+            ident.2 = 'CD14+ Monocytes',
+            test.use = 'LR',
+            latent.vars = 'nCount_atac')
+
+head(da_peaks)
+
+```
+
+This uses Seurat's `FindMarkers` function to identify peaks that are significantly differentially accessible between the 2 groups we specified. `pct.1` and `pct.2` tells us in how many of the `indent.1` and `ident.2` cells these peaks are accessible in, respectively.
+
+The violin plots below show the expression level of the first peak identified by `FindMarkers`.
+
+```{r}
+da_plot1 <- VlnPlot(object = pbmc,
+                    features = rownames(da_peaks)[1],
+                    pt.size = 0.1,
+                    idents = c('pDC', 'CD14+ Monocytes'))
+
+da_plot2 <- VlnPlot(object = pbmc,
+                    features = rownames(da_peaks)[1],
+                    pt.size = 0.1)
+
+da_plot1 | da_plot2
+
+```
+
+```{r}
+# fold change between 2 groups of cells 
+fc <- FoldChange(object = pbmc, 
+                 ident.1 = 'pDC',
+                 ident.2 = 'CD14+ Monocytes')
+
+# order by FC
+fc <- fc[order(fc$avg_log2FC, decreasing=T),]
+
+head(fc)
+
+```
+
+Computed the fold change in expression of peaks between the 2 groups specified, and we've sorted the resulting table in descending order.
+
+## Plotting genomic regions
+
+The coverage plot below shows the genomic region of the first peak from `da_peaks`. Notice that the `Genes` section shows that the gene is on the - strand (arrows pointing left). Thus, its promoter would be on the right. The signal shows how many fragments from these regions were measured. As implied by the experiments above, it is most accessible in those cells classified as pDC cells.
+
+```{r}
+# set plotting order
+levels(pbmc) <- unique(pbmc$predicted.id)
+
+CoveragePlot(object = pbmc,
+             region = rownames(da_peaks)[1],
+             extend.upstream = 40000,
+             extend.downstream = 20000)
+
+```
+

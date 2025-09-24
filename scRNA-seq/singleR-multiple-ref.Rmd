@@ -1,0 +1,212 @@
+---
+title: "SingleR - multiple reference"
+author: "Layaa Sivakumar"
+date: "2025-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning = FALSE)
+```
+
+# Exploring SingleR: Automatic annotation for single-cell RNA-seq data using multiple reference datasets
+
+Using multiple reference sets has many advantages:
+
+* The diversity in the available cell type labels increases
+* Results of annotation may be more accurate 
+* Allows cross-validation of annotation i.e., if a cell is labelled as monocyte in multiple references, it is more likely to actually be a monocyte. 
+
+
+```{r}
+library(SingleR)
+library(celldex)
+library(Seurat)
+library(tidyverse)
+library(pheatmap)
+
+```
+
+The dataset I'll be working on for this project is single cell RNA-seq data derived from human peripheral blood mononuclear cells (PBMCs) of a healthy female donor aged 25-30. The data was obtained by 10x Genomics from AllCells. 
+
+```{r, Load data}
+# Load data 
+
+hdf5_obj <- Read10X_h5(filename = "C:\\Users\\layaa\\Documents\\2024\\Homework\\PD-project-datasets\\singleR\\20k_PBMC_3p_HT_nextgem_Chromium_X_filtered_feature_bc_matrix.h5",
+                       use.names = TRUE,
+                       unique.features = TRUE)
+
+pbmc.seurat <- CreateSeuratObject(counts=hdf5_obj)
+
+```
+
+
+```{r, Filtering and QC}
+# Filtering and QC
+
+# These parameters filter out cells with few genes detected and high mitochondrial genes, and genes that are expressed at low levels across all cells
+pbmc.seurat$mitoPercent <- PercentageFeatureSet(pbmc.seurat, pattern = '^MT-')
+pbmc.seurat.filtered <- subset(pbmc.seurat, subset = nCount_RNA > 800 &
+         nFeature_RNA > 500 &
+         mitoPercent < 10)
+
+```
+
+
+```{r Standard sc workflow}
+# Standard workflow
+pbmc.seurat.filtered <- NormalizeData(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- FindVariableFeatures(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- ScaleData(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- RunPCA(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- FindNeighbors(object = pbmc.seurat.filtered, dims = 1:20)
+pbmc.seurat.filtered <- FindClusters(object = pbmc.seurat.filtered)
+pbmc.seurat.filtered <- RunUMAP(object = pbmc.seurat.filtered, dims = 1:20)
+
+# running steps above to get clusters
+View(pbmc.seurat.filtered@meta.data)
+DimPlot(pbmc.seurat.filtered, reduction = 'umap')
+```
+
+For this dataset, I will be using 2 references from the celldex package: the human primary cell atlas data and the database immune cell expression data. 
+
+```{r}
+# for pbmc data, we will use two datasets
+hpca <- celldex::HumanPrimaryCellAtlasData()
+dice <- celldex::DatabaseImmuneCellExpressionData()
+
+```
+
+There are different strategies we can use to annotate cells using multiple references with singleR. We will be looking at all 3 of them. 
+
+The first uses reference-specific labels, where we include a prefix to the label that indicates which reference the annotation comes from. Then, we combine all the references into one dataset that includes only the shared genes. 
+
+```{r}
+# ...1. Strategy 1: Using reference-specific labels ----------
+# adding ref info to labels
+hpca$label.main <- paste0('HPCA.', hpca$label.main)
+dice$label.main <- paste0('DICE.', dice$label.main)
+
+# create a combined ref based on shared genes 
+shared <- intersect(rownames(hpca), rownames(dice))
+combined <- cbind(hpca[shared,], dice[shared,])
+
+# run singleR using combined ref
+# saving counts into a separate object
+pbmc_counts <- GetAssayData(pbmc.seurat.filtered, slot = 'counts')
+
+comb.res1 <- SingleR(test = pbmc_counts, ref = combined, labels = combined$label.main)
+table(comb.res1$labels)
+
+pbmc.seurat.filtered$com.res1.labels <- comb.res1[match(rownames(pbmc.seurat.filtered@meta.data), rownames(comb.res1)), 'labels']
+View(pbmc.seurat.filtered@meta.data)
+
+DimPlot(pbmc.seurat.filtered, reduction = 'umap', group.by = 'com.res1.labels', label = TRUE)
+
+```
+
+The second strategy does not process the references before passing them into singleR. Instead, both references are passed in a list. After the annotation is complete, we can extract which reference dataset the final label came from, and the differentially expressed genes that define each label per reference. 
+
+```{r}
+# ...2. Strategy 2: Comparing scores across references ----------
+# remove prefixes from labels
+hpca$label.main <- gsub('HPCA\\.','', hpca$label.main)
+dice$label.main <- gsub('DICE\\.','', dice$label.main)
+
+comb.res2 <- SingleR(test = pbmc_counts, 
+        ref = list(HPCA = hpca, DICE = dice),
+        labels = list(hpca$label.main, dice$label.main))
+
+# Check the final label from the combined assignment.
+table(comb.res2$labels)
+
+# which reference scored best for which label?
+grouping <- paste0(comb.res2$labels,'.', comb.res2$reference)
+best_ref <- as.data.frame(split(comb.res2, grouping))
+
+# get de. genes from each individual references
+metadata(comb.res2$orig.results$HPCA)$de.genes
+metadata(comb.res2$orig.results$DICE)$de.genes
+
+# Combined diagnostics
+plotScoreHeatmap(comb.res2)
+
+# UMAP
+pbmc.seurat.filtered$comb.res2.labels <- comb.res2[match(rownames(pbmc.seurat.filtered@meta.data), rownames(comb.res2)), 'labels']
+DimPlot(pbmc.seurat.filtered, reduction = 'umap', group.by = 'comb.res2.labels', label = TRUE)
+
+```
+
+The third strategy involves using the ontology term held in the label.ont column in the reference datasets as the annotation label. This standardizes labels between references so that there 
+
+```{r}
+# ...3. Strategy 3: Using Harmonized Labels ----------
+
+hpca.ont <- celldex::HumanPrimaryCellAtlasData(cell.ont = 'nonna')
+dice.ont <- celldex::DatabaseImmuneCellExpressionData(cell.ont = 'nonna')
+
+# Using the same sets of genes:
+shared <- intersect(rownames(hpca.ont), rownames(dice.ont))
+hpca.ont <- hpca.ont[shared,]
+dice.ont <- dice.ont[shared,]
+
+# Showing the top 10 most frequent terms:
+tail(sort(table(hpca.ont$label.ont)),10)
+tail(sort(table(dice.ont$label.ont)), 10)
+
+# using label.ont instead on label.main while running SingleR
+
+com.res3 <- SingleR(test = pbmc_counts,
+        ref = list(HPCA = hpca.ont, DICE = dice.ont),
+        labels = list(hpca.ont$label.ont, dice.ont$label.ont))
+
+
+table(com.res3$labels)
+
+pbmc.seurat.filtered$com.res3.labels <- com.res3[match(rownames(pbmc.seurat.filtered@meta.data), rownames(com.res3)), 'labels']
+DimPlot(pbmc.seurat.filtered, reduction = 'umap', group.by = 'com.res3.labels', label = TRUE)
+
+```
+
+The ontology terms can then be mapped back to the labels using the built in mapping TSV file in the celldex package. The process is shown here: 
+
+```{r}
+# To map cell ontology terms
+# get the mapping tsv files 
+
+colData(hpca.ont)
+colData(dice.ont)
+
+hpca.fle <- system.file("mapping","hpca.tsv", package = "celldex")
+hpca.mapping <- read.delim(hpca.fle, header = F)
+
+dice.fle <- system.file("mapping","dice.tsv", package = "celldex")
+dice.mapping <- read.delim(dice.fle, header = F)
+
+```
+
+
+```{r}
+# map the assigned ontology terms to the label for each cell 
+
+hpca_set <- trial %>%
+  mutate(com.res3.main.labels = hpca.mapping$hpca.label.res3[match(com.res3.labels, hpca.mapping$com.res3.labels)])
+
+dice_set <- hpca_set %>%
+  filter(is.na(com.res3.main.labels)) %>%
+  mutate(com.res3.main.labels = dice.mapping$V1[match(com.res3.labels, dice.mapping$V2)])
+
+ont.mapping <- hpca_set %>% 
+  filter(!is.na(com.res3.main.labels)) %>%
+  rbind(., dice_set)
+
+pbmc.seurat.filtered$com.res3.ont.mapping <- ont.mapping[match(rownames(pbmc.seurat.filtered@meta.data), rownames(ont.mapping)), "com.res3.main.labels"]
+
+DimPlot(pbmc.seurat.filtered, reduction = 'umap', group.by = 'com.res3.ont.mapping', label = TRUE)
+```
+
+
+
+
+
+
